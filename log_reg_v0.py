@@ -16,12 +16,12 @@ class LogisticRegression(nn.Module):
     def forward(self, x):
         return self.lin(x).sigmoid().view(-1)
 
-    def pred(self, x, threshold=0.5):
+    def pred(self, x, threshold: float = 0.5):
         y_pred = self.forward(x)
         return torch.where(y_pred > threshold, 1, 0)
 
 
-def get_model(n_features, lr=0.01):
+def get_model(n_features, lr: float = 0.01):
     model = LogisticRegression(n_features)
     return model, SGD(model.parameters(), lr)
 
@@ -67,7 +67,7 @@ def main():
     # Define key-variables
     learning_rate = 0.01
     num_feat = x_train.shape[1]
-    epochs = 10000
+    epochs = 1000
 
     model, optimizer = get_model(num_feat, learning_rate)
     train_ds, valid_ds = (x_train, y_train), (x_valid, y_valid)
@@ -92,6 +92,10 @@ def main():
     test_pred = model.pred(x_test)
     print('************* Test Report *************')
     print(classification_report(y_test, test_pred))
+
+    # Print trained model weights and bias
+    print(f'Model Weights: {model.lin.weight.data}')
+    print(f'Model bias: {model.lin.bias.item()}')
 
 
 if __name__ == '__main__':
