@@ -7,12 +7,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.optim import SGD
 from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.metrics import (
-    classification_report,
-    f1_score,
-    confusion_matrix,
-    accuracy_score,
-)
+
 from sklearn.model_selection import train_test_split
 from copy import deepcopy
 
@@ -20,8 +15,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODE = "eval"
 DATA_PATH = "./data/twitter.csv"
 
-CLASSES = 3
-
+N_CLASSES = 3
+EPSILON = 1e-7
 # Vectorizer Parameters
 PATT = r"\S+"
 MIN_WORD_FREQ = 3
@@ -31,7 +26,7 @@ SAVE_BEST = True
 FIT_DEBUG = True
 
 # Session Parameters
-SID = 2  # session number IMPRTANT: CHANGE BETWEEN SCRIPT ACTIVATION!
+SID = 1  # session number IMPRTANT: CHANGE BETWEEN SCRIPT ACTIVATION!
 SAMPLE_SIZE = None  # int: use part of the data. None: use all of the data
 SRST = 5  # session random state
 EPOCHS = 20000
@@ -92,10 +87,14 @@ def fit(
                     train_pred = model.pred(x_train)
                     valid_pred = model.pred(x_valid)
                     # Print loss, accuracy, and f1_score for train and validation
-                    train_acc = accuracy_score(y_train, train_pred)
-                    valid_acc = accuracy_score(y_valid, valid_pred)
-                    train_macro_f1 = f1_score(y_train, train_pred, average="macro")
-                    val_macro_f1 = f1_score(y_valid, valid_pred, average="macro")
+                    train_acc = (y_train == train_pred).float().mean()
+                    valid_acc = (y_valid == valid_pred).float().mean()
+                    train_macro_f1 = calculate_metrics(con_mat(y_train, train_pred))[
+                        "macro_f1"
+                    ]
+                    val_macro_f1 = calculate_metrics(con_mat(y_valid, valid_pred))[
+                        "macro_f1"
+                    ]
                     print(
                         f"Epoch {epoch}: Train Loss = {train_loss:.5f}, Val Loss = {valid_loss:.5f} | "
                         f"Train Acc = {train_acc:.5f}, Val Acc = {valid_acc:.5f} | Train F1 = {train_macro_f1:.5f}, "
@@ -111,6 +110,59 @@ def fit(
         save_model(best_model, f"{SPATH}/models/model_best_epoch_{best_epoch}")
 
     return train_losses, valid_losses
+
+
+def con_mat(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    """
+    Calculate confusion matrix for multi-class classification.
+
+    Args:
+        y_true: Ground truth labels
+        y_pred: Predicted labels
+
+    Returns:
+        torch.Tensor: N_CLASSES x N_CLASSES confusion matrix
+    """
+    cm = torch.zeros((N_CLASSES, N_CLASSES), device=DEVICE)
+    for i in range(N_CLASSES):
+        for j in range(N_CLASSES):
+            cm[i, j] = ((y_true == i) & (y_pred == j)).sum()
+    return cm
+
+
+def calculate_metrics(confusion_matrix: torch.Tensor) -> dict:
+    """
+    Calculate precision, recall, and F1-score for each class.
+
+    Args:
+        confusion_matrix: N_CLASSES x N_CLASSES confusion matrix
+
+    Returns:
+        dict: Dictionary containing precision, recall, and F1-score for each class,
+              plus macro-averaged F1 score
+    """
+    metrics = {}
+    n_classes = confusion_matrix.shape[0]
+
+    for i in range(n_classes):
+        tp = confusion_matrix[i, i]
+        fp = confusion_matrix[:, i].sum() - tp
+        fn = confusion_matrix[i, :].sum() - tp
+
+        precision = tp / (tp + fp + EPSILON)
+        recall = tp / (tp + fn + EPSILON)
+        f1 = 2 * precision * recall / (precision + recall + EPSILON)
+
+        metrics[f"class_{i}"] = {
+            "precision": precision.item(),
+            "recall": recall.item(),
+            "f1": f1.item(),
+        }
+
+    metrics["macro_f1"] = (
+        sum(metrics[f"class_{i}"]["f1"] for i in range(n_classes)) / n_classes
+    )
+    return metrics
 
 
 def create_vectorizer(train_data) -> CountVectorizer:
@@ -211,8 +263,8 @@ def main():
         cv = create_vectorizer(train_df.iloc[:, 0])
 
         # Same vectorizer along the sessions so save it once
-        os.makedirs(f"{SPATH}/models")
-        os.makedirs(f"{SPATH}/plots")
+        os.makedirs(f"{SPATH}/models", exist_ok=True)
+        os.makedirs(f"{SPATH}/plots", exist_ok=True)
         save_vectorizer(cv)
 
         with open(f"{SPATH}/s{SID}_info.log", "a") as f:
@@ -230,7 +282,7 @@ def main():
         # Create Model
         num_features = len(cv.vocabulary_)
         lr = 0.001
-        model, opt = get_model(num_features, CLASSES)
+        model, opt = get_model(num_features, N_CLASSES)
 
         # Train the model(s)
         criteria = nn.CrossEntropyLoss()
@@ -257,6 +309,7 @@ def main():
         file_eval = open(f"{SPATH}/{fname}_eval.log", "w")
         with torch.inference_mode():
             model, cv_loaded = load_model_and_vectorizer(SID, fname)
+            model.eval()
             x_train, y_train = df2tensors(train_df, cv_loaded)
             x_valid, y_valid = df2tensors(valid_df, cv_loaded)
             x_test, y_test = df2tensors(test_df, cv_loaded)
@@ -265,36 +318,21 @@ def main():
             print("For Train dataset:", file=file_eval)
 
             train_pred = model.pred(x_train)
+            train_cm = con_mat(y_train, train_pred)
             print(
-                classification_report(y_train, train_pred, zero_division=0),
+                calculate_metrics(train_cm),
                 file=file_eval,
             )
-            # print(confusion_matrix(y_train, train_pred))
 
-            print(
-                f"Mean F1_Score: {f1_score(y_train, train_pred, average='macro')}",
-                file=file_eval,
-            )
             print("For Validation dataset:", file=file_eval)
             val_pred = model.pred(x_valid)
-            print(
-                classification_report(y_valid, val_pred, zero_division=0),
-                file=file_eval,
-            )
-            print(
-                f"Mean F1_Score: {f1_score(y_valid,val_pred, average='macro')}",
-                file=file_eval,
-            )
+            val_cm = con_mat(y_train, val_pred)
+            print(calculate_metrics(val_cm), file=file_eval)
+
             print("For Test dataset:", file=file_eval)
             test_pred = model.pred(x_test)
-            print(
-                classification_report(y_test, test_pred, zero_division=0),
-                file=file_eval,
-            )
-            print(
-                f"Mean F1_Score: {f1_score(y_test,test_pred, average='macro')}",
-                file=file_eval,
-            )
+            test_cm = con_mat(y_test, test_pred)
+            print(calculate_metrics(test_cm), file=file_eval)
             file_eval.close()
 
 
