@@ -8,17 +8,21 @@ from torch.optim import SGD
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import classification_report, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
+from copy import deepcopy
 
 
 PATT = r"\S+"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODE = "eval"
+MODE = "train"
 SAMPLE_SIZE = None
 DATA_PATH = "./data/twitter.csv"
 MIN_WORD_FREQ = 3
 MODEL_FN = "sample"
 CLASSES = 3
 EPOCHS = 10000
+
+EPOCHS_PER_SAVE = 200
+SAVE_BEST = True
 
 
 class LogisticRegression(nn.Module):
@@ -42,24 +46,37 @@ def get_model(n_features, n_classes, lr: float = 0.001):
     return model, SGD(model.parameters(), lr)
 
 
-def fit(EPOCHS, model, loss_func, opt, train, valid) -> tuple[list, list]:
+def fit(
+    epochs, model: nn.Module, vect, loss_func, opt, train, valid
+) -> tuple[list, list]:
     x_train, y_train = train
     x_valid, y_valid = valid
     train_losses, valid_losses = [], []
-    for epoch in range(EPOCHS):
+    if SAVE_BEST:
+        min_val_loss = float("inf")
+    for epoch in range(epochs):
         train_pred = model(x_train)
         train_loss = loss_func(train_pred, y_train)
         train_losses.append(train_loss.item())
 
         model.eval()
         with torch.no_grad():
-            valid_loss = loss_func(model(x_valid), y_valid)
-            valid_losses.append(valid_loss.item())
+            valid_loss = loss_func(model(x_valid), y_valid).item()
+            if SAVE_BEST and valid_loss < min_val_loss:
+                best_model = deepcopy(model)
+                min_val_loss = valid_loss
+            valid_losses.append(valid_loss)
 
         model.train()
         opt.zero_grad()
         train_loss.backward()
         opt.step()
+
+        if EPOCHS_PER_SAVE and epoch % EPOCHS_PER_SAVE == 0:
+            save_model_and_vectorizer(model, vect, f"model_epcoh_{epoch}")
+
+    if SAVE_BEST:
+        save_model_and_vectorizer(best_model, vect, f"model_best")
 
     return train_losses, valid_losses
 
@@ -168,7 +185,7 @@ def main():
         train = (x_train, y_train)
         valid = (x_valid, y_valid)
 
-        train_losses, valid_losses = fit(EPOCHS, model, criteria, opt, train, valid)
+        train_losses, valid_losses = fit(EPOCHS, model, cv, criteria, opt, train, valid)
         # Save plots
         save_plots(train_losses, valid_losses)
         # Save them
