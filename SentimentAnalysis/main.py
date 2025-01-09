@@ -19,8 +19,8 @@ KAGGLE_OUTPUT_PATH = "/kaggle/working/"
 LOCAL_DATA_PATH = "./data"
 LOCAL_OUTPUT_PATH = "."
 
-DATA_PATH = LOCAL_DATA_PATH
-OUTPUT_PATH = LOCAL_OUTPUT_PATH
+DATA_PATH = KAGGLE_DATA_PATH
+OUTPUT_PATH = KAGGLE_OUTPUT_PATH
 
 os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
@@ -37,7 +37,11 @@ SAVE_BEST = True
 LR = 0.1
 MAX_EPOCHS = 100
 EPOCHS_PER_VALIDATION = 10
-EPOCHS_PER_SAVE = 200
+SCHEDULER_PATIENCE = 5
+EPOCHS_PER_CHPNT = 10
+PATIENCE_LIMIT = 10
+
+DEBUG = False
 
 
 accuray = torchmetrics.Accuracy(
@@ -70,6 +74,22 @@ class LogisticRegression(nn.Module):
             return y_pred.argmax(dim=1)
 
 
+class MetricsLog:
+    def __init__(self) -> None:
+        self.loss: list[float] = []
+        self.accuracy: list[float] = []
+        self.precision: list[float] = []
+        self.recall: list[float] = []
+        self.f1_score: list[float] = []
+
+    def add(self, loss, acc, pre, rec, f1):
+        self.loss.append(loss)
+        self.accuracy.append(acc)
+        self.precision.append(pre)
+        self.recall.append(rec)
+        self.f1_score.append(f1)
+
+
 def get_model(n_features, n_classes, lr: float = 0.001):
     model = LogisticRegression(n_features, n_classes)
     return model, torch.optim.Adam(model.parameters(), lr)
@@ -100,13 +120,23 @@ def fit(
     opt,
     train_dl: DataLoader,
     valid_dl: DataLoader,
-) -> tuple[list, list]:
-    train_losses, valid_losses = [], []
+) -> tuple[MetricsLog, MetricsLog]:
+
+    train_metrics, valid_metrics = MetricsLog(), MetricsLog()
 
     num_train_batches = len(train_dl)
     num_valid_batches = len(valid_dl)
 
-    for epoch in range(epochs):
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer=opt, mode="min", factor=0.5, patience=SCHEDULER_PATIENCE
+    )
+
+    patience_counter = 0
+
+    if SAVE_BEST:
+        min_valid_loss = float("inf")
+
+    for epoch in range(epochs + 1):
         validate = True if epoch % EPOCHS_PER_VALIDATION == 0 else False
 
         if validate:
@@ -149,10 +179,15 @@ def fit(
 
                 valid_acc, valid_prec, valid_rec, valid_f1 = compute_all_metrics()
                 valid_loss = valid_cum_loss / num_valid_batches
+                scheduler.step(valid_loss)
                 valid_cum_loss = 0
 
-                train_losses.append(train_loss)
-                valid_losses.append(valid_loss)
+                train_metrics.add(
+                    train_loss, train_acc, train_prec, train_rec, train_f1
+                )
+                valid_metrics.add(
+                    valid_loss, valid_acc, valid_prec, valid_rec, valid_f1
+                )
 
                 print(
                     f"Epoch {epoch}: Train Loss = {train_loss:.5f}, Val Loss = {valid_loss:.5f} | "
@@ -160,7 +195,34 @@ def fit(
                     f"Val F1 = {valid_f1:.5f}"
                 )
 
-    return train_losses, valid_losses
+            if SAVE_BEST and valid_loss < min_valid_loss:
+                best_model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+
+            if epoch > 0 and PATIENCE_LIMIT is not None:
+                # update counts
+                prev_valid_loss = valid_metrics.loss[-2]
+                patience_counter = (
+                    patience_counter + 1 if valid_loss >= prev_valid_loss else 0
+                )
+                if DEBUG:
+                    print(
+                        f"Pateience_counter: {patience_counter}, val_loss: {valid_loss}, prev_loss: {prev_valid_loss}"
+                    )
+                if patience_counter >= PATIENCE_LIMIT:
+                    print(f"Early stopping triggered ({PATIENCE_LIMIT} bad epochs)")
+                    break
+
+        if epoch % EPOCHS_PER_CHPNT == 0:
+            save_model(model, f"epoch_{epoch}_checkpoint")
+
+    if SAVE_BEST:
+        torch.save(
+            best_model_sd,
+            os.path.join(OUTPUT_PATH, "models", f"best_model_epoch{best_epoch}.pt"),
+        )
+
+    return train_metrics, valid_metrics
 
 
 def con_mat(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
@@ -267,21 +329,6 @@ def load_data():
     return train, valid, test
 
 
-def split_data(
-    df: pd.DataFrame, ratios: tuple[float, float, float], save: bool = False
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    train_ratio, valid_ratio, test_ratio = ratios
-    temp, test = train_test_split(df, test_size=test_ratio, random_state=1)
-    train, valid = train_test_split(
-        temp, test_size=valid_ratio / (train_ratio + valid_ratio), random_state=1
-    )
-    if save:
-        train.to_csv("./data/train.csv", index=False)
-        valid.to_csv("./data/valid.csv", index=False)
-        test.to_csv("./data/test.csv", index=False)
-    return train, valid, test
-
-
 def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
     x = df.iloc[:, 0]
     x = cv.transform(x).toarray()  # type: ignore
@@ -310,12 +357,13 @@ def main():
     if MODE == "train":
         # preprocess it with CountVectorizer
         cv = create_vectorizer(train_df.iloc[:, 0])
-
         # Same vectorizer along the sessions so save it once
-
         save_vectorizer(cv)
 
         with open(f"info.log", "a") as f:
+            f.write(
+                f"Total Epochs: {MAX_EPOCHS}, Batch Size: {BS}, Epochs_per_validation: {EPOCHS_PER_VALIDATION}\n"
+            )
             f.write(
                 f"Vocabulary Size: {len(cv.vocabulary_)}. Minimum Word Frequency: {MIN_WORD_FREQ}. Pattern: "
             )
@@ -347,17 +395,20 @@ def main():
         # Train the model(s)
         criteria = nn.CrossEntropyLoss()
 
-        train_losses, valid_losses = fit(
+        train_stats, valid_stats = fit(
             MAX_EPOCHS, model, criteria, opt, train_loader, valid_loader
         )
+        train_losses = train_stats.loss
+        valid_losses = valid_stats.loss
         # Save plots
         save_plots(train_losses, valid_losses)
-        save_model(model, f"{MAX_EPOCHS}_epochs")
+        # Save the model after all epochs
+        save_model(model, f"final_model")
         # Evaluate it with the test data
     elif MODE == "eval":
         model_fname = "s2e6499"
-        vect_fname = ""
-        file_eval = open(f"{model_fname}_eval.log", "w")
+        vect_fname = "vectorizer"
+        file_eval = open(os.path.join(OUTPUT_PATH, f"{model_fname}_eval.log"), "w")
         with torch.inference_mode():
             model, cv_loaded = load_model_and_vectorizer(model_fname, vect_fname)
             model.eval()
