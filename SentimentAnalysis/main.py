@@ -1,6 +1,7 @@
 import os
 import torch
 import pandas as pd
+import numpy as np
 import _pickle as pickle
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -16,11 +17,11 @@ MODE = "train"
 KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
 KAGGLE_OUTPUT_PATH = "/kaggle/working/"
 
-LOCAL_DATA_PATH = "./data"
+LOCAL_DATA_PATH = "./small_data"
 LOCAL_OUTPUT_PATH = "."
 
-DATA_PATH = KAGGLE_DATA_PATH
-OUTPUT_PATH = KAGGLE_OUTPUT_PATH
+DATA_PATH = LOCAL_DATA_PATH
+OUTPUT_PATH = LOCAL_OUTPUT_PATH
 
 os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
@@ -35,7 +36,7 @@ MIN_WORD_FREQ = 3
 
 SAVE_BEST = True
 LR = 0.1
-MAX_EPOCHS = 100
+MAX_EPOCHS = 50
 EPOCHS_PER_VALIDATION = 10
 SCHEDULER_PATIENCE = 5
 EPOCHS_PER_CHPNT = 10
@@ -76,18 +77,20 @@ class LogisticRegression(nn.Module):
 
 class MetricsLog:
     def __init__(self) -> None:
-        self.loss: list[float] = []
-        self.accuracy: list[float] = []
-        self.precision: list[float] = []
-        self.recall: list[float] = []
-        self.f1_score: list[float] = []
+        self.metrics = {
+            "loss": [],
+            "accuracy": [],
+            "precision": [],
+            "recall": [],
+            "f1_score": [],
+        }
 
     def add(self, loss, acc, pre, rec, f1):
-        self.loss.append(loss)
-        self.accuracy.append(acc)
-        self.precision.append(pre)
-        self.recall.append(rec)
-        self.f1_score.append(f1)
+        self.metrics["loss"].append(loss)
+        self.metrics["accuracy"].append(acc)
+        self.metrics["precision"].append(pre)
+        self.metrics["recall"].append(rec)
+        self.metrics["f1_score"].append(f1)
 
 
 def get_model(n_features, n_classes, lr: float = 0.001):
@@ -198,10 +201,11 @@ def fit(
             if SAVE_BEST and valid_loss < min_valid_loss:
                 best_model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
                 best_epoch = epoch
+                min_valid_loss = valid_loss
 
             if epoch > 0 and PATIENCE_LIMIT is not None:
                 # update counts
-                prev_valid_loss = valid_metrics.loss[-2]
+                prev_valid_loss = valid_metrics.metrics["loss"][-2]
                 patience_counter = (
                     patience_counter + 1 if valid_loss >= prev_valid_loss else 0
                 )
@@ -337,14 +341,23 @@ def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
     return x, y
 
 
-def save_plots(train_ls, valid_ls):
-    plt.figure(figsize=(16, 9))
-    plt.plot(train_ls, label="Train Loss", color="blue")
-    plt.plot(valid_ls, label="Valid Loss", color="red")
-    plt.legend(loc="best")
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_PATH, "plots", "validations.png"))
-    plt.close()
+def save_plots(train_stats: MetricsLog, valid_stats: MetricsLog):
+    x = np.arange(0, len(train_stats.metrics["loss"])) * EPOCHS_PER_VALIDATION
+
+    for metric_name, train_values in train_stats.metrics.items():
+        validation_values = valid_stats.metrics[metric_name]
+
+        plt.figure(figsize=(16, 9))
+        plt.plot(x, train_values, label="Train Loss", color="blue")
+        plt.plot(x, validation_values, label="Valid Loss", color="red")
+        plt.title(metric_name.capitalize())
+        plt.xlabel("Epoch")
+        plt.ylabel(metric_name.capitalize())
+        plt.title(f"{metric_name} During Training")
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_PATH, "plots", f"{metric_name}_comparison.png"))
+        plt.close()
 
 
 def main():
@@ -360,7 +373,7 @@ def main():
         # Same vectorizer along the sessions so save it once
         save_vectorizer(cv)
 
-        with open(f"info.log", "a") as f:
+        with open(f"info.log", "w") as f:
             f.write(
                 f"Total Epochs: {MAX_EPOCHS}, Batch Size: {BS}, Epochs_per_validation: {EPOCHS_PER_VALIDATION}\n"
             )
@@ -398,10 +411,10 @@ def main():
         train_stats, valid_stats = fit(
             MAX_EPOCHS, model, criteria, opt, train_loader, valid_loader
         )
-        train_losses = train_stats.loss
-        valid_losses = valid_stats.loss
+        # train_losses = train_stats.loss
+        # valid_losses = valid_stats.loss
         # Save plots
-        save_plots(train_losses, valid_losses)
+        save_plots(train_stats, valid_stats)
         # Save the model after all epochs
         save_model(model, f"final_model")
         # Evaluate it with the test data
