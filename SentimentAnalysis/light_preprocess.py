@@ -1,5 +1,9 @@
 import pandas as pd
+import os
 from sklearn.model_selection import train_test_split
+
+SAVE_PATH = "./small_data"
+os.makedirs(f"{SAVE_PATH}", exist_ok=True)
 
 
 def clean_data(path: str) -> pd.DataFrame:
@@ -20,7 +24,12 @@ def split_data(
         temp, test_size=valid_ratio / (train_ratio + valid_ratio), random_state=1
     )
     if save:
-        train.to_csv("./data/train.csv", index=False)
-        valid.to_csv("./data/valid.csv", index=False)
-        test.to_csv("./data/test.csv", index=False)
+        train.to_csv(os.path.join(SAVE_PATH, "train.csv"), index=False)
+        valid.to_csv(os.path.join(SAVE_PATH, "valid.csv"), index=False)
+        test.to_csv(os.path.join(SAVE_PATH, "test.csv"), index=False)
     return train, valid, test
+
+
+df = clean_data("./data/twitter_raw.csv")
+df = df.sample(30000, random_state=1)
+split_data(df, (0.6, 0.2, 0.2), save=True)

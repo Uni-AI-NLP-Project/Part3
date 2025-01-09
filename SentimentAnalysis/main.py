@@ -1,4 +1,5 @@
 import os
+import shutil
 import torch
 import pandas as pd
 import numpy as np
@@ -10,8 +11,6 @@ import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import classification_report, ConfusionMatrixDisplay
 
-from copy import deepcopy
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODE = "train"
 
@@ -19,13 +18,21 @@ KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
 KAGGLE_OUTPUT_PATH = "/kaggle/working/"
 
 LOCAL_DATA_PATH = "./small_data"
-LOCAL_OUTPUT_PATH = "./s2"
+LOCAL_OUTPUT_PATH = "./s3"
 
 DATA_PATH = LOCAL_DATA_PATH
 OUTPUT_PATH = LOCAL_OUTPUT_PATH
 
+if MODE == "train" and os.path.exists(OUTPUT_PATH):
+    ans = input("output path already exists, delete and continue? (y/n)? ")
+    if ans == "y":
+        shutil.rmtree(OUTPUT_PATH)
+    else:
+        exit()
+
 os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
+os.makedirs(os.path.join(OUTPUT_PATH, "evaluations"), exist_ok=True)
 
 BS = 40000
 
@@ -41,9 +48,9 @@ MAX_EPOCHS = 300
 EPOCHS_PER_VALIDATION = 20
 SCHEDULER_PATIENCE = 5
 EPOCHS_PER_CHPNT = 10
-PATIENCE_LIMIT = 4
+PATIENCE_LIMIT = None
 
-DEBUG = False
+DEBUG = True
 
 
 accuray = torchmetrics.Accuracy(
@@ -78,7 +85,7 @@ class LogisticRegression(nn.Module):
 
 class MetricsLog:
     def __init__(self) -> None:
-        self.metrics = {
+        self.metrics: dict[str, list[float]] = {
             "loss": [],
             "accuracy": [],
             "precision": [],
@@ -114,7 +121,12 @@ def reset_all_metrics():
 
 
 def compute_all_metrics():
-    return accuray.compute(), precision.compute(), recall.compute(), f1_score.compute()
+    return (
+        accuray.compute().item(),
+        precision.compute().item(),
+        recall.compute().item(),
+        f1_score.compute().item(),
+    )
 
 
 def fit(
@@ -127,7 +139,7 @@ def fit(
 ) -> tuple[MetricsLog, MetricsLog]:
 
     train_metrics, valid_metrics = MetricsLog(), MetricsLog()
-
+    log_fname = open(os.path.join(OUTPUT_PATH, "training_stats.log"), "w")
     num_train_batches = len(train_dl)
     num_valid_batches = len(valid_dl)
 
@@ -193,11 +205,13 @@ def fit(
                     valid_loss, valid_acc, valid_prec, valid_rec, valid_f1
                 )
 
-                print(
+                stats = (
                     f"Epoch {epoch}: Train Loss = {train_loss:.5f}, Val Loss = {valid_loss:.5f} | "
                     f"Train Acc = {train_acc:.5f}, Val Acc = {valid_acc:.5f} | Train F1 = {train_f1:.5f}, "
                     f"Val F1 = {valid_f1:.5f}"
                 )
+                print(stats)
+                log_fname.write(f"{stats}\n")
 
             if SAVE_BEST and valid_loss < min_valid_loss:
                 best_model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -217,6 +231,8 @@ def fit(
                 if patience_counter >= PATIENCE_LIMIT:
                     print(f"Early stopping triggered ({PATIENCE_LIMIT} bad epochs)")
                     break
+            if DEBUG:
+                print(f"get_lr: {scheduler.get_last_lr()}")
 
         if epoch % EPOCHS_PER_CHPNT == 0:
             save_model(model, f"epoch_{epoch}_checkpoint")
@@ -224,8 +240,12 @@ def fit(
     if SAVE_BEST:
         torch.save(
             best_model_sd,
-            os.path.join(OUTPUT_PATH, "models", f"best_model_epoch{best_epoch}.pt"),
+            os.path.join(
+                OUTPUT_PATH, "models", f"best_loss_model_epoch{best_epoch}.pt"
+            ),
         )
+
+    log_fname.close()
 
     return train_metrics, valid_metrics
 
@@ -365,7 +385,6 @@ def save_plots(train_stats: MetricsLog, valid_stats: MetricsLog):
 
 def main():
     # Load the cleaned data
-
     train_df, valid_df, test_df = load_data()
 
     print(f"Using {DEVICE} device")
@@ -394,6 +413,7 @@ def main():
             batch_size=BS,
             shuffle=True,
             pin_memory=True,
+            num_workers=2,
         )
 
         valid_loader = DataLoader(
@@ -401,6 +421,7 @@ def main():
             batch_size=2 * BS,
             shuffle=False,
             pin_memory=True,
+            num_workers=2,
         )
         # Create Model
         num_features = len(cv.vocabulary_)
@@ -414,17 +435,18 @@ def main():
         train_stats, valid_stats = fit(
             MAX_EPOCHS, model, criteria, opt, train_loader, valid_loader
         )
-        # train_losses = train_stats.loss
-        # valid_losses = valid_stats.loss
+
         # Save plots
         save_plots(train_stats, valid_stats)
         # Save the model after all epochs
         save_model(model, f"final_model")
         # Evaluate it with the test data
     elif MODE == "eval":
-        model_fname = "final_model"
+        model_fname = "best_model_epoch20"
         vect_fname = "vectorizer"
-        file_eval = open(os.path.join(OUTPUT_PATH, f"{model_fname}_eval.log"), "w")
+        file_eval = open(
+            os.path.join(OUTPUT_PATH, "evaluations", f"{model_fname}_eval.log"), "w"
+        )
         with torch.inference_mode():
             model, cv_loaded = load_model_and_vectorizer(model_fname, vect_fname)
             model = model.cpu()
@@ -452,7 +474,8 @@ def main():
             )
             disp.plot(cmap="Greys")
             plt.savefig(
-                os.path.join(OUTPUT_PATH, "plots", f"{model_fname}_cm.png"), dpi=500
+                os.path.join(OUTPUT_PATH, "evaluations", f"{model_fname}_cm.png"),
+                dpi=300,
             )
             plt.close()
 
