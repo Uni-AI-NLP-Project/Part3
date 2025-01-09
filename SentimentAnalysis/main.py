@@ -411,7 +411,9 @@ def main():
         file_eval = open(os.path.join(OUTPUT_PATH, f"{model_fname}_eval.log"), "w")
         with torch.inference_mode():
             model, cv_loaded = load_model_and_vectorizer(model_fname, vect_fname)
+            model = model.cpu()
             model.eval()
+
             x_test, y_test = df2tensors(test_df, cv_loaded)
 
             print(
