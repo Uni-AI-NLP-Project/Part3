@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import torchmetrics
 import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+
 from copy import deepcopy
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -18,7 +19,7 @@ KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
 KAGGLE_OUTPUT_PATH = "/kaggle/working/"
 
 LOCAL_DATA_PATH = "./small_data"
-LOCAL_OUTPUT_PATH = "."
+LOCAL_OUTPUT_PATH = "./s2"
 
 DATA_PATH = LOCAL_DATA_PATH
 OUTPUT_PATH = LOCAL_OUTPUT_PATH
@@ -36,11 +37,11 @@ MIN_WORD_FREQ = 3
 
 SAVE_BEST = True
 LR = 0.1
-MAX_EPOCHS = 50
-EPOCHS_PER_VALIDATION = 10
+MAX_EPOCHS = 300
+EPOCHS_PER_VALIDATION = 20
 SCHEDULER_PATIENCE = 5
 EPOCHS_PER_CHPNT = 10
-PATIENCE_LIMIT = 10
+PATIENCE_LIMIT = 4
 
 DEBUG = False
 
@@ -319,7 +320,9 @@ def load_model_and_vectorizer(model_fname, vect_fname):
 
     # Load model state
     model.load_state_dict(
-        torch.load(os.path.join(OUTPUT_PATH, f"{model_fname}.pt"), weights_only=True)
+        torch.load(
+            os.path.join(OUTPUT_PATH, "models", f"{model_fname}.pt"), weights_only=True
+        )
     )
 
     return model, vectorizer
@@ -373,7 +376,7 @@ def main():
         # Same vectorizer along the sessions so save it once
         save_vectorizer(cv)
 
-        with open(f"info.log", "w") as f:
+        with open(os.path.join(OUTPUT_PATH, "info.log"), "w") as f:
             f.write(
                 f"Total Epochs: {MAX_EPOCHS}, Batch Size: {BS}, Epochs_per_validation: {EPOCHS_PER_VALIDATION}\n"
             )
@@ -419,7 +422,7 @@ def main():
         save_model(model, f"final_model")
         # Evaluate it with the test data
     elif MODE == "eval":
-        model_fname = "s2e6499"
+        model_fname = "final_model"
         vect_fname = "vectorizer"
         file_eval = open(os.path.join(OUTPUT_PATH, f"{model_fname}_eval.log"), "w")
         with torch.inference_mode():
@@ -436,8 +439,22 @@ def main():
             print("For Test dataset:", file=file_eval)
             test_pred = model.pred(x_test)
             test_cm = con_mat(y_test, test_pred)
+            print(test_cm, file=file_eval)
             print(calculate_metrics(test_cm), file=file_eval)
+            print(
+                classification_report(y_test.numpy(), test_pred.numpy()), file=file_eval
+            )
             file_eval.close()
+
+            disp = ConfusionMatrixDisplay(
+                test_cm.int().numpy(),
+                display_labels=["negative", "neutral", "positive"],
+            )
+            disp.plot(cmap="Greys")
+            plt.savefig(
+                os.path.join(OUTPUT_PATH, "plots", f"{model_fname}_cm.png"), dpi=500
+            )
+            plt.close()
 
 
 if __name__ == "__main__":
