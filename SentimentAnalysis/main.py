@@ -12,9 +12,20 @@ from copy import deepcopy
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODE = "train"
-DATA_PATH = "./data/twitter.csv"
 
-BS = 5000
+KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
+KAGGLE_OUTPUT_PATH = "/kaggle/working/"
+
+LOCAL_DATA_PATH = "./data"
+LOCAL_OUTPUT_PATH = "."
+
+DATA_PATH = LOCAL_DATA_PATH
+OUTPUT_PATH = LOCAL_OUTPUT_PATH
+
+os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
+os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
+
+BS = 40000
 
 N_CLASSES = 3
 EPSILON = 1e-7
@@ -23,25 +34,24 @@ PATT = r"\S+"
 MIN_WORD_FREQ = 3
 
 SAVE_BEST = True
-FIT_DEBUG = True
 LR = 0.1
 MAX_EPOCHS = 100
 EPOCHS_PER_VALIDATION = 10
 EPOCHS_PER_SAVE = 200
 
-os.makedirs(f"models", exist_ok=True)
-os.makedirs(f"plots", exist_ok=True)
 
 accuray = torchmetrics.Accuracy(
     task="multiclass", num_classes=N_CLASSES, average="micro"
-)
+).to(DEVICE)
 precision = torchmetrics.Precision(
     task="multiclass", num_classes=N_CLASSES, average="macro"
-)
-recall = torchmetrics.Recall(task="multiclass", num_classes=N_CLASSES, average="macro")
+).to(DEVICE)
+recall = torchmetrics.Recall(
+    task="multiclass", num_classes=N_CLASSES, average="macro"
+).to(DEVICE)
 f1_score = torchmetrics.F1Score(
     task="multiclass", num_classes=N_CLASSES, average="macro"
-)
+).to(DEVICE)
 
 
 class LogisticRegression(nn.Module):
@@ -65,6 +75,13 @@ def get_model(n_features, n_classes, lr: float = 0.001):
     return model, torch.optim.Adam(model.parameters(), lr)
 
 
+def update_metrics(pred, true):
+    accuray.update(pred, true)
+    precision.update(pred, true)
+    recall.update(pred, true)
+    f1_score.update(pred, true)
+
+
 def reset_all_metrics():
     accuray.reset()
     precision.reset()
@@ -86,15 +103,11 @@ def fit(
 ) -> tuple[list, list]:
     train_losses, valid_losses = [], []
 
-    if SAVE_BEST:
-        min_val_loss = float("inf")
-        best_epoch = 0
-
     num_train_batches = len(train_dl)
     num_valid_batches = len(valid_dl)
 
     for epoch in range(epochs):
-        validate = True if epoch % EPOCHS_PER_SAVE == 0 else False
+        validate = True if epoch % EPOCHS_PER_VALIDATION == 0 else False
 
         if validate:
             reset_all_metrics()
@@ -114,10 +127,7 @@ def fit(
                 model.eval()
                 with torch.inference_mode():
                     train_cum_loss += train_batch_loss.item()
-                    accuray.update(yb, train_logits)
-                    precision.update(yb, train_logits)
-                    recall.update(yb, train_logits)
-                    f1_score.update(yb, train_logits)
+                    update_metrics(train_logits, yb)
 
         if validate:
             model.eval()
@@ -135,10 +145,7 @@ def fit(
                     valid_batch_loss = loss_func(valid_logits, yb)
 
                     valid_cum_loss += valid_batch_loss.item()
-                    accuray.update(yb, valid_logits)
-                    precision.update(yb, valid_logits)
-                    recall.update(yb, valid_logits)
-                    f1_score.update(yb, valid_logits)
+                    update_metrics(valid_logits, yb)
 
                 valid_acc, valid_prec, valid_rec, valid_f1 = compute_all_metrics()
                 valid_loss = valid_cum_loss / num_valid_batches
@@ -217,18 +224,20 @@ def create_vectorizer(train_data) -> CountVectorizer:
 
 def save_vectorizer(vect):
     # Save vectorizer using pickle
-    with open(f"vectorizer.pkl", "wb") as f:
+    with open(os.path.join(OUTPUT_PATH, "vectorizer.pkl"), "wb") as f:
         pickle.dump(vect, file=f)
 
 
 def save_model(model, filename):
-    """Save both the model state and the vectorizer."""
+    """Save the model."""
     # Save model state
-    torch.save(model.state_dict(), f"{filename}.pt")
+    torch.save(
+        model.state_dict(), os.path.join(OUTPUT_PATH, "models", f"{filename}.pt")
+    )
 
 
-def load_vectorizer(path) -> CountVectorizer:
-    with open(os.path.join(path), "rb") as f:
+def load_vectorizer(fname) -> CountVectorizer:
+    with open(os.path.join(OUTPUT_PATH, f"{fname}.pkl"), "rb") as f:
         vectorizer = pickle.load(f)
         return vectorizer
 
@@ -240,18 +249,20 @@ def load_model_and_vectorizer(model_fname, vect_fname):
     vectorizer = load_vectorizer(vect_fname)
 
     # Create model with correct input size
-    model = LogisticRegression(len(vectorizer.vocabulary_), 3)
+    model = LogisticRegression(len(vectorizer.vocabulary_), N_CLASSES)
 
     # Load model state
-    model.load_state_dict(torch.load(f"./models/{model_fname}.pt", weights_only=True))
+    model.load_state_dict(
+        torch.load(os.path.join(OUTPUT_PATH, f"{model_fname}.pt"), weights_only=True)
+    )
 
     return model, vectorizer
 
 
 def load_data():
-    train = pd.read_csv("./data/train.csv")
-    valid = pd.read_csv("./data/valid.csv")
-    test = pd.read_csv("./data/test.csv")
+    train = pd.read_csv(os.path.join(DATA_PATH, "train.csv"))
+    valid = pd.read_csv(os.path.join(DATA_PATH, "valid.csv"))
+    test = pd.read_csv(os.path.join(DATA_PATH, "test.csv"))
 
     return train, valid, test
 
@@ -279,19 +290,13 @@ def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
     return x, y
 
 
-# def to_dataloader(x, y):
-#     ds = TensorDataset(x, y)
-#     dl = DataLoader(dataset=ds,
-#                     pin_memory=True)
-
-
 def save_plots(train_ls, valid_ls):
     plt.figure(figsize=(16, 9))
     plt.plot(train_ls, label="Train Loss", color="blue")
     plt.plot(valid_ls, label="Valid Loss", color="red")
     plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(f"plots/loss_plot.png")
+    plt.savefig(os.path.join(OUTPUT_PATH, "plots", "validations.png"))
     plt.close()
 
 
@@ -328,7 +333,7 @@ def main():
         )
 
         valid_loader = DataLoader(
-            dataset=TensorDataset(x_train, y_train),
+            dataset=TensorDataset(x_valid, y_valid),
             batch_size=2 * BS,
             shuffle=False,
             pin_memory=True,
@@ -350,43 +355,17 @@ def main():
         save_model(model, f"{MAX_EPOCHS}_epochs")
         # Evaluate it with the test data
     elif MODE == "eval":
-        """
-        Important: Ensure the evaluation uses the same data as the training.
-        Check the '.log' file in the saved session directory and verify these parameters match:
-
-        SAMPLE_SIZE: number of samples
-        SRT: Random state for data sampling and splitting.
-        SID: For correct CountVectorizer and model initialization
-        """
         model_fname = "s2e6499"
         vect_fname = ""
         file_eval = open(f"{model_fname}_eval.log", "w")
         with torch.inference_mode():
             model, cv_loaded = load_model_and_vectorizer(model_fname, vect_fname)
             model.eval()
-            x_train, y_train = df2tensors(
-                train_df,
-                cv_loaded,
-            )
-            x_valid, y_valid = df2tensors(valid_df, cv_loaded)
             x_test, y_test = df2tensors(test_df, cv_loaded)
 
             print(
                 f"********** {model_fname.upper()} Performance *******", file=file_eval
             )
-            print("For Train dataset:", file=file_eval)
-
-            train_pred = model.pred(x_train)
-            train_cm = con_mat(y_train, train_pred)
-            print(
-                calculate_metrics(train_cm),
-                file=file_eval,
-            )
-
-            print("For Validation dataset:", file=file_eval)
-            val_pred = model.pred(x_valid)
-            val_cm = con_mat(y_train, val_pred)
-            print(calculate_metrics(val_cm), file=file_eval)
 
             print("For Test dataset:", file=file_eval)
             test_pred = model.pred(x_test)
