@@ -1,19 +1,31 @@
 import os
-import pandas as pd
-import numpy as np
-import _pickle as pickle
 import torch
+import pandas as pd
+import _pickle as pickle
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import torchmetrics
 import matplotlib.pyplot as plt
-from torch.optim import SGD
 from sklearn.feature_extraction.text import CountVectorizer
-
 from sklearn.model_selection import train_test_split
 from copy import deepcopy
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODE = "eval"
-DATA_PATH = "./data/twitter.csv"
+MODE = "train"
+
+KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
+KAGGLE_OUTPUT_PATH = "/kaggle/working/"
+
+LOCAL_DATA_PATH = "./data"
+LOCAL_OUTPUT_PATH = "."
+
+DATA_PATH = LOCAL_DATA_PATH
+OUTPUT_PATH = LOCAL_OUTPUT_PATH
+
+os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
+os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
+
+BS = 40000
 
 N_CLASSES = 3
 EPSILON = 1e-7
@@ -21,16 +33,25 @@ EPSILON = 1e-7
 PATT = r"\S+"
 MIN_WORD_FREQ = 3
 
-EPOCHS_PER_SAVE = 1000
 SAVE_BEST = True
-FIT_DEBUG = True
+LR = 0.1
+MAX_EPOCHS = 100
+EPOCHS_PER_VALIDATION = 10
+EPOCHS_PER_SAVE = 200
 
-# Session Parameters
-SID = 1  # session number IMPRTANT: CHANGE BETWEEN SCRIPT ACTIVATION!
-SAMPLE_SIZE = None  # int: use part of the data. None: use all of the data
-SRST = 5  # session random state
-EPOCHS = 20000
-SPATH = f"sessions/s{SID}"
+
+accuray = torchmetrics.Accuracy(
+    task="multiclass", num_classes=N_CLASSES, average="micro"
+).to(DEVICE)
+precision = torchmetrics.Precision(
+    task="multiclass", num_classes=N_CLASSES, average="macro"
+).to(DEVICE)
+recall = torchmetrics.Recall(
+    task="multiclass", num_classes=N_CLASSES, average="macro"
+).to(DEVICE)
+f1_score = torchmetrics.F1Score(
+    task="multiclass", num_classes=N_CLASSES, average="macro"
+).to(DEVICE)
 
 
 class LogisticRegression(nn.Module):
@@ -51,63 +72,93 @@ class LogisticRegression(nn.Module):
 
 def get_model(n_features, n_classes, lr: float = 0.001):
     model = LogisticRegression(n_features, n_classes)
-    return model, SGD(model.parameters(), lr)
+    return model, torch.optim.Adam(model.parameters(), lr)
+
+
+def update_metrics(pred, true):
+    accuray.update(pred, true)
+    precision.update(pred, true)
+    recall.update(pred, true)
+    f1_score.update(pred, true)
+
+
+def reset_all_metrics():
+    accuray.reset()
+    precision.reset()
+    recall.reset()
+    f1_score.reset()
+
+
+def compute_all_metrics():
+    return accuray.compute(), precision.compute(), recall.compute(), f1_score.compute()
 
 
 def fit(
-    epochs, model: LogisticRegression, loss_func, opt, train, valid
+    epochs,
+    model: LogisticRegression,
+    loss_func,
+    opt,
+    train_dl: DataLoader,
+    valid_dl: DataLoader,
 ) -> tuple[list, list]:
-    x_train, y_train = train
-    x_valid, y_valid = valid
     train_losses, valid_losses = [], []
-    if SAVE_BEST:
-        min_val_loss = float("inf")
-        best_epoch = 0
+
+    num_train_batches = len(train_dl)
+    num_valid_batches = len(valid_dl)
 
     for epoch in range(epochs):
-        # Training phase
-        train_logits = model(x_train)
-        train_loss = loss_func(train_logits, y_train)
-        train_losses.append(train_loss.item())
+        validate = True if epoch % EPOCHS_PER_VALIDATION == 0 else False
 
-        model.eval()
-        with torch.no_grad():
-            valid_logits = model(x_valid)
-            valid_loss = loss_func(valid_logits, y_valid).item()
-            valid_losses.append(valid_loss)
-
-            if SAVE_BEST and valid_loss < min_val_loss:
-                best_model = deepcopy(model)
-                min_val_loss = valid_loss
-                best_epoch = epoch
-
-            if EPOCHS_PER_SAVE and (epoch + 1) % EPOCHS_PER_SAVE == 0:
-                save_model(model, f"{SPATH}/models/s{SID}e{epoch}")
-                if FIT_DEBUG:
-                    train_pred = model.pred(x_train)
-                    valid_pred = model.pred(x_valid)
-                    # Print loss, accuracy, and f1_score for train and validation
-                    train_acc = (y_train == train_pred).float().mean()
-                    valid_acc = (y_valid == valid_pred).float().mean()
-                    train_macro_f1 = calculate_metrics(con_mat(y_train, train_pred))[
-                        "macro_f1"
-                    ]
-                    val_macro_f1 = calculate_metrics(con_mat(y_valid, valid_pred))[
-                        "macro_f1"
-                    ]
-                    print(
-                        f"Epoch {epoch}: Train Loss = {train_loss:.5f}, Val Loss = {valid_loss:.5f} | "
-                        f"Train Acc = {train_acc:.5f}, Val Acc = {valid_acc:.5f} | Train F1 = {train_macro_f1:.5f}, "
-                        f"Val F1 = {val_macro_f1:.5f}"
-                    )
+        if validate:
+            reset_all_metrics()
+            train_cum_loss = 0
 
         model.train()
-        opt.zero_grad()
-        train_loss.backward()
-        opt.step()
+        for xb, yb in train_dl:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            train_logits = model(xb)
+            train_batch_loss = loss_func(train_logits, yb)
 
-    if SAVE_BEST:
-        save_model(best_model, f"{SPATH}/models/model_best_epoch_{best_epoch}")
+            train_batch_loss.backward()
+            opt.step()
+            opt.zero_grad()
+
+            if validate:
+                model.eval()
+                with torch.inference_mode():
+                    train_cum_loss += train_batch_loss.item()
+                    update_metrics(train_logits, yb)
+
+        if validate:
+            model.eval()
+            with torch.inference_mode():
+                train_acc, train_prec, train_rec, train_f1 = compute_all_metrics()
+                train_loss = train_cum_loss / num_train_batches
+                train_cum_loss = 0
+
+                # Compute metrics on validation
+                reset_all_metrics()
+                valid_cum_loss = 0
+                for xb, yb in valid_dl:
+                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                    valid_logits = model(xb)
+                    valid_batch_loss = loss_func(valid_logits, yb)
+
+                    valid_cum_loss += valid_batch_loss.item()
+                    update_metrics(valid_logits, yb)
+
+                valid_acc, valid_prec, valid_rec, valid_f1 = compute_all_metrics()
+                valid_loss = valid_cum_loss / num_valid_batches
+                valid_cum_loss = 0
+
+                train_losses.append(train_loss)
+                valid_losses.append(valid_loss)
+
+                print(
+                    f"Epoch {epoch}: Train Loss = {train_loss:.5f}, Val Loss = {valid_loss:.5f} | "
+                    f"Train Acc = {train_acc:.5f}, Val Acc = {valid_acc:.5f} | Train F1 = {train_f1:.5f}, "
+                    f"Val F1 = {valid_f1:.5f}"
+                )
 
     return train_losses, valid_losses
 
@@ -173,43 +224,45 @@ def create_vectorizer(train_data) -> CountVectorizer:
 
 def save_vectorizer(vect):
     # Save vectorizer using pickle
-    with open(f"{SPATH}/s{SID}_vectorizer.pkl", "wb") as f:
+    with open(os.path.join(OUTPUT_PATH, "vectorizer.pkl"), "wb") as f:
         pickle.dump(vect, file=f)
 
 
 def save_model(model, filename):
-    """Save both the model state and the vectorizer."""
+    """Save the model."""
     # Save model state
-    torch.save(model.state_dict(), f"{filename}.pt")
+    torch.save(
+        model.state_dict(), os.path.join(OUTPUT_PATH, "models", f"{filename}.pt")
+    )
 
 
-def load_vectorizer(session_id: int) -> CountVectorizer:
-    with open(f"./sessions/s{session_id}/s{session_id}_vectorizer.pkl", "rb") as f:
+def load_vectorizer(fname) -> CountVectorizer:
+    with open(os.path.join(OUTPUT_PATH, f"{fname}.pkl"), "rb") as f:
         vectorizer = pickle.load(f)
         return vectorizer
 
 
-def load_model_and_vectorizer(session_id, fname):
+def load_model_and_vectorizer(model_fname, vect_fname):
     """Load both the model state and the vectorizer."""
 
     # Load vectorizer
-    vectorizer = load_vectorizer(session_id)
+    vectorizer = load_vectorizer(vect_fname)
 
     # Create model with correct input size
-    model = LogisticRegression(len(vectorizer.vocabulary_), 3)
+    model = LogisticRegression(len(vectorizer.vocabulary_), N_CLASSES)
 
     # Load model state
     model.load_state_dict(
-        torch.load(f"./sessions/s{session_id}/models/{fname}.pt", weights_only=True)
+        torch.load(os.path.join(OUTPUT_PATH, f"{model_fname}.pt"), weights_only=True)
     )
 
     return model, vectorizer
 
 
 def load_data():
-    train = pd.read_csv("./data/train.csv")
-    valid = pd.read_csv("./data/valid.csv")
-    test = pd.read_csv("./data/test.csv")
+    train = pd.read_csv(os.path.join(DATA_PATH, "train.csv"))
+    valid = pd.read_csv(os.path.join(DATA_PATH, "valid.csv"))
+    test = pd.read_csv(os.path.join(DATA_PATH, "test.csv"))
 
     return train, valid, test
 
@@ -218,9 +271,9 @@ def split_data(
     df: pd.DataFrame, ratios: tuple[float, float, float], save: bool = False
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     train_ratio, valid_ratio, test_ratio = ratios
-    temp, test = train_test_split(df, test_size=test_ratio, random_state=SRST)
+    temp, test = train_test_split(df, test_size=test_ratio, random_state=1)
     train, valid = train_test_split(
-        temp, test_size=valid_ratio / (train_ratio + valid_ratio), random_state=SRST
+        temp, test_size=valid_ratio / (train_ratio + valid_ratio), random_state=1
     )
     if save:
         train.to_csv("./data/train.csv", index=False)
@@ -232,8 +285,8 @@ def split_data(
 def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
     x = df.iloc[:, 0]
     x = cv.transform(x).toarray()  # type: ignore
-    x = torch.tensor(x, dtype=torch.float).to(DEVICE)
-    y = torch.tensor(df.iloc[:, 1].values, dtype=torch.long).to(DEVICE)
+    x = torch.tensor(x, dtype=torch.float)
+    y = torch.tensor(df.iloc[:, 1].values, dtype=torch.long)
     return x, y
 
 
@@ -243,18 +296,14 @@ def save_plots(train_ls, valid_ls):
     plt.plot(valid_ls, label="Valid Loss", color="red")
     plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(f"{SPATH}/plots/loss_plot.png")
+    plt.savefig(os.path.join(OUTPUT_PATH, "plots", "validations.png"))
     plt.close()
 
 
 def main():
-    # Load the raw data
-    if SAMPLE_SIZE:
-        df = pd.read_csv(DATA_PATH)
-        df = df.sample(SAMPLE_SIZE, random_state=SRST)
-        train_df, valid_df, test_df = split_data(df, (0.6, 0.2, 0.2))
-    else:
-        train_df, valid_df, test_df = load_data()
+    # Load the cleaned data
+
+    train_df, valid_df, test_df = load_data()
 
     print(f"Using {DEVICE} device")
 
@@ -263,14 +312,10 @@ def main():
         cv = create_vectorizer(train_df.iloc[:, 0])
 
         # Same vectorizer along the sessions so save it once
-        os.makedirs(f"{SPATH}/models", exist_ok=True)
-        os.makedirs(f"{SPATH}/plots", exist_ok=True)
+
         save_vectorizer(cv)
 
-        with open(f"{SPATH}/s{SID}_info.log", "a") as f:
-            f.write(
-                f"Session Number: {SID}. Samples: {SAMPLE_SIZE}. Random State: {SRST}. Total Epochs: {EPOCHS}\n"
-            )
+        with open(f"info.log", "a") as f:
             f.write(
                 f"Vocabulary Size: {len(cv.vocabulary_)}. Minimum Word Frequency: {MIN_WORD_FREQ}. Pattern: "
             )
@@ -279,55 +324,48 @@ def main():
         x_train, y_train = df2tensors(train_df, cv)
         x_valid, y_valid = df2tensors(valid_df, cv)
 
+        # Wrap in DataLoaeders
+        train_loader = DataLoader(
+            dataset=TensorDataset(x_train, y_train),
+            batch_size=BS,
+            shuffle=True,
+            pin_memory=True,
+        )
+
+        valid_loader = DataLoader(
+            dataset=TensorDataset(x_valid, y_valid),
+            batch_size=2 * BS,
+            shuffle=False,
+            pin_memory=True,
+        )
         # Create Model
         num_features = len(cv.vocabulary_)
-        lr = 0.001
-        model, opt = get_model(num_features, N_CLASSES)
+
+        model, opt = get_model(num_features, N_CLASSES, lr=LR)
+        model = model.to(DEVICE)
 
         # Train the model(s)
         criteria = nn.CrossEntropyLoss()
 
-        # Pack the train and valid
-        train = (x_train, y_train)
-        valid = (x_valid, y_valid)
-
-        train_losses, valid_losses = fit(EPOCHS, model, criteria, opt, train, valid)
+        train_losses, valid_losses = fit(
+            MAX_EPOCHS, model, criteria, opt, train_loader, valid_loader
+        )
         # Save plots
         save_plots(train_losses, valid_losses)
-
+        save_model(model, f"{MAX_EPOCHS}_epochs")
         # Evaluate it with the test data
     elif MODE == "eval":
-        """
-        Important: Ensure the evaluation uses the same data as the training.
-        Check the '.log' file in the saved session directory and verify these parameters match:
-
-        SAMPLE_SIZE: number of samples
-        SRT: Random state for data sampling and splitting.
-        SID: For correct CountVectorizer and model initialization
-        """
-        fname = "s2e6499"
-        file_eval = open(f"{SPATH}/{fname}_eval.log", "w")
+        model_fname = "s2e6499"
+        vect_fname = ""
+        file_eval = open(f"{model_fname}_eval.log", "w")
         with torch.inference_mode():
-            model, cv_loaded = load_model_and_vectorizer(SID, fname)
+            model, cv_loaded = load_model_and_vectorizer(model_fname, vect_fname)
             model.eval()
-            x_train, y_train = df2tensors(train_df, cv_loaded)
-            x_valid, y_valid = df2tensors(valid_df, cv_loaded)
             x_test, y_test = df2tensors(test_df, cv_loaded)
 
-            print(f"********** {fname.upper()} Performance *******", file=file_eval)
-            print("For Train dataset:", file=file_eval)
-
-            train_pred = model.pred(x_train)
-            train_cm = con_mat(y_train, train_pred)
             print(
-                calculate_metrics(train_cm),
-                file=file_eval,
+                f"********** {model_fname.upper()} Performance *******", file=file_eval
             )
-
-            print("For Validation dataset:", file=file_eval)
-            val_pred = model.pred(x_valid)
-            val_cm = con_mat(y_train, val_pred)
-            print(calculate_metrics(val_cm), file=file_eval)
 
             print("For Test dataset:", file=file_eval)
             test_pred = model.pred(x_test)
