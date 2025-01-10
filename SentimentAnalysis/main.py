@@ -18,21 +18,11 @@ KAGGLE_DATA_PATH = "/kaggle/input/twitter-ds"
 KAGGLE_OUTPUT_PATH = "/kaggle/working/"
 
 LOCAL_DATA_PATH = "./small_data"
-LOCAL_OUTPUT_PATH = "./s3"
+LOCAL_OUTPUT_PATH = "./s1"
 
 DATA_PATH = LOCAL_DATA_PATH
 OUTPUT_PATH = LOCAL_OUTPUT_PATH
 
-if MODE == "train" and os.path.exists(OUTPUT_PATH):
-    ans = input("output path already exists, delete and continue? (y/n)? ")
-    if ans == "y":
-        shutil.rmtree(OUTPUT_PATH)
-    else:
-        exit()
-
-os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
-os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
-os.makedirs(os.path.join(OUTPUT_PATH, "evaluations"), exist_ok=True)
 
 BS = 40000
 
@@ -44,8 +34,8 @@ MIN_WORD_FREQ = 3
 
 SAVE_BEST = True
 LR = 0.1
-MAX_EPOCHS = 300
-EPOCHS_PER_VALIDATION = 20
+MAX_EPOCHS = 50
+EPOCHS_PER_VALIDATION = 5
 SCHEDULER_PATIENCE = 5
 EPOCHS_PER_CHPNT = 10
 PATIENCE_LIMIT = None
@@ -102,11 +92,35 @@ class MetricsLog:
 
 
 def get_model(n_features, n_classes, lr: float = 0.001):
+    """
+    Creates a logistic regression model with the specified input and output dimensions
+    and initializes the Adam optimizer with a given learning rate.
+
+    Args:
+        n_features (int): The number of features in the input data.
+        n_classes (int): The number of target classes for classification.
+        lr (float, optional): Learning rate for the optimizer. Defaults to 0.001.
+
+    Returns:
+        tuple:
+            - LogisticRegression: The initialized model.
+            - torch.optim.Adam: Optimizer for training the model.
+    """
     model = LogisticRegression(n_features, n_classes)
     return model, torch.optim.Adam(model.parameters(), lr)
 
 
 def update_metrics(pred, true):
+    """
+    Updates the accuracy, precision, recall, and F1 metrics using predicted and actual labels.
+
+    Args:
+        pred (torch.Tensor): Predicted labels for the batch.
+        true (torch.Tensor): True labels for the batch.
+
+    Note:
+        Metrics are aggregated across batches and reset before validation.
+    """
     accuray.update(pred, true)
     precision.update(pred, true)
     recall.update(pred, true)
@@ -114,6 +128,11 @@ def update_metrics(pred, true):
 
 
 def reset_all_metrics():
+    """
+    Resets the stored values of accuracy, precision, recall, and F1-score.
+    Should be called before computing metrics for a new dataset or epoch.
+    """
+
     accuray.reset()
     precision.reset()
     recall.reset()
@@ -121,6 +140,16 @@ def reset_all_metrics():
 
 
 def compute_all_metrics():
+    """
+    Computes aggregated accuracy, precision, recall, and F1-score.
+
+    Returns:
+        tuple:
+            - float: Accuracy score.
+            - float: Precision score (macro-averaged).
+            - float: Recall score (macro-averaged).
+            - float: F1-score (macro-averaged).
+    """
     return (
         accuray.compute().item(),
         precision.compute().item(),
@@ -129,14 +158,27 @@ def compute_all_metrics():
     )
 
 
-def fit(
-    epochs,
-    model: LogisticRegression,
-    loss_func,
-    opt,
-    train_dl: DataLoader,
-    valid_dl: DataLoader,
-) -> tuple[MetricsLog, MetricsLog]:
+def fit(epochs, model, loss_func, opt, train_dl, valid_dl):
+    """
+    Implements the training loop for a logistic regression model, with validation
+    at specified intervals and support for learning rate scheduling and early stopping.
+
+    Args:
+        epochs (int): Total number of epochs to train the model.
+        model (LogisticRegression): The logistic regression model to be trained.
+        loss_func (nn.Module): Loss function (e.g., CrossEntropyLoss).
+        opt (torch.optim.Optimizer): Optimizer for gradient descent.
+        train_dl (DataLoader): DataLoader for training data.
+        valid_dl (DataLoader): DataLoader for validation data.
+
+    Returns:
+        tuple:
+            - MetricsLog: Training metrics logged over epochs.
+            - MetricsLog: Validation metrics logged over epochs.
+
+    Note:
+        Best-performing model based on validation loss is saved during training.
+    """
 
     train_metrics, valid_metrics = MetricsLog(), MetricsLog()
     log_fname = open(os.path.join(OUTPUT_PATH, "training_stats.log"), "w")
@@ -151,6 +193,7 @@ def fit(
 
     if SAVE_BEST:
         min_valid_loss = float("inf")
+        min_valid_f1 = float("inf")
 
     for epoch in range(epochs + 1):
         validate = True if epoch % EPOCHS_PER_VALIDATION == 0 else False
@@ -214,9 +257,14 @@ def fit(
                 log_fname.write(f"{stats}\n")
 
             if SAVE_BEST and valid_loss < min_valid_loss:
-                best_model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
-                best_epoch = epoch
-                min_valid_loss = valid_loss
+                last_f1 = valid_metrics.metrics["f1_score"][-1]
+                if valid_loss < min_valid_loss:
+                    best_model_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+                    best_epoch = epoch
+                    min_valid_loss = valid_loss
+                if last_f1 < min_valid_f1:
+                    best_f1 = {k: v.cpu() for k, v in model.state_dict().items()}
+                    min_valid_f1 = last_f1
 
             if epoch > 0 and PATIENCE_LIMIT is not None:
                 # update counts
@@ -233,6 +281,10 @@ def fit(
                     break
             if DEBUG:
                 print(f"get_lr: {scheduler.get_last_lr()}")
+                acc_m = train_metrics.metrics["accuracy"]
+                if len(acc_m) > 0:
+                    print(f"type of saved stats in metric log: {type(acc_m[0])}")
+                print(type(train_metrics.metrics["accuracy"]))
 
         if epoch % EPOCHS_PER_CHPNT == 0:
             save_model(model, f"epoch_{epoch}_checkpoint")
@@ -243,6 +295,10 @@ def fit(
             os.path.join(
                 OUTPUT_PATH, "models", f"best_loss_model_epoch{best_epoch}.pt"
             ),
+        )
+        torch.save(
+            best_model_sd,
+            os.path.join(OUTPUT_PATH, "models", f"best_f1_score:{min_valid_f1:.4f}.pt"),
         )
 
     log_fname.close()
@@ -304,19 +360,42 @@ def calculate_metrics(confusion_matrix: torch.Tensor) -> dict:
 
 
 def create_vectorizer(train_data) -> CountVectorizer:
+    """
+    Initialize and fit a CountVectorizer on the training data.
+
+    Args:
+        train_data (iterable): Training data containing text samples.
+
+    Returns:
+        CountVectorizer: Fitted vectorizer instance.
+    """
+
     cv = CountVectorizer(min_df=MIN_WORD_FREQ, binary=True, token_pattern=PATT)
     cv.fit(train_data)
     return cv
 
 
 def save_vectorizer(vect):
+    """
+    Save a fitted CountVectorizer to a file.
+
+    Args:
+        vect (CountVectorizer): Fitted vectorizer to save.
+    """
     # Save vectorizer using pickle
     with open(os.path.join(OUTPUT_PATH, "vectorizer.pkl"), "wb") as f:
         pickle.dump(vect, file=f)
 
 
 def save_model(model, filename):
-    """Save the model."""
+    """
+    Save a PyTorch model to a file.
+
+    Args:
+        model (nn.Module): The model to save.
+        filename (str): Name of the file for saving the model.
+    """
+
     # Save model state
     torch.save(
         model.state_dict(), os.path.join(OUTPUT_PATH, "models", f"{filename}.pt")
@@ -324,13 +403,32 @@ def save_model(model, filename):
 
 
 def load_vectorizer(fname) -> CountVectorizer:
+    """
+    Load a saved CountVectorizer from a file.
+
+    Args:
+        fname (str): Name of the file containing the vectorizer.
+
+    Returns:
+        CountVectorizer: Loaded vectorizer instance.
+    """
+
     with open(os.path.join(OUTPUT_PATH, f"{fname}.pkl"), "rb") as f:
         vectorizer = pickle.load(f)
         return vectorizer
 
 
 def load_model_and_vectorizer(model_fname, vect_fname):
-    """Load both the model state and the vectorizer."""
+    """
+    Load a saved model and vectorizer from files.
+
+    Args:
+        model_fname (str): File name of the model.
+        vect_fname (str): File name of the vectorizer.
+
+    Returns:
+        tuple: Loaded model and vectorizer.
+    """
 
     # Load vectorizer
     vectorizer = load_vectorizer(vect_fname)
@@ -349,6 +447,13 @@ def load_model_and_vectorizer(model_fname, vect_fname):
 
 
 def load_data():
+    """
+    Load the training, validation, and test datasets.
+
+    Returns:
+        tuple: DataFrames for training, validation, and test datasets.
+    """
+
     train = pd.read_csv(os.path.join(DATA_PATH, "train.csv"))
     valid = pd.read_csv(os.path.join(DATA_PATH, "valid.csv"))
     test = pd.read_csv(os.path.join(DATA_PATH, "test.csv"))
@@ -357,6 +462,17 @@ def load_data():
 
 
 def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
+    """
+    Convert a DataFrame to tensors using a fitted CountVectorizer.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing text and label columns.
+        cv (CountVectorizer): Fitted vectorizer for text transformation.
+
+    Returns:
+        tuple: Feature tensor (X) and label tensor (Y).
+    """
+
     x = df.iloc[:, 0]
     x = cv.transform(x).toarray()  # type: ignore
     x = torch.tensor(x, dtype=torch.float)
@@ -365,6 +481,14 @@ def df2tensors(df: pd.DataFrame, cv: CountVectorizer):
 
 
 def save_plots(train_stats: MetricsLog, valid_stats: MetricsLog):
+    """
+    Generate and save training and validation metric plots.
+
+    Args:
+        train_stats (MetricsLog): Metrics log for training.
+        valid_stats (MetricsLog): Metrics log for validation.
+    """
+
     x = np.arange(0, len(train_stats.metrics["loss"])) * EPOCHS_PER_VALIDATION
 
     for metric_name, train_values in train_stats.metrics.items():
@@ -390,6 +514,20 @@ def main():
     print(f"Using {DEVICE} device")
 
     if MODE == "train":
+
+        if OUTPUT_PATH != KAGGLE_OUTPUT_PATH and os.path.exists(OUTPUT_PATH):
+            ans = input(
+                "output path already exists, delete and continue with training? (y/n)? "
+            )
+            if ans == "y":
+                shutil.rmtree(OUTPUT_PATH)
+            else:
+                exit()
+
+        os.makedirs(os.path.join(OUTPUT_PATH, "models"), exist_ok=True)
+        os.makedirs(os.path.join(OUTPUT_PATH, "plots"), exist_ok=True)
+        os.makedirs(os.path.join(OUTPUT_PATH, "evaluations"), exist_ok=True)
+
         # preprocess it with CountVectorizer
         cv = create_vectorizer(train_df.iloc[:, 0])
         # Same vectorizer along the sessions so save it once
@@ -413,7 +551,6 @@ def main():
             batch_size=BS,
             shuffle=True,
             pin_memory=True,
-            num_workers=2,
         )
 
         valid_loader = DataLoader(
@@ -421,7 +558,6 @@ def main():
             batch_size=2 * BS,
             shuffle=False,
             pin_memory=True,
-            num_workers=2,
         )
         # Create Model
         num_features = len(cv.vocabulary_)
